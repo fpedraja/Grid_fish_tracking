@@ -47,14 +47,14 @@ Dists = pdist2(XYmeas, XYgrid);
 Wproto = exp(-Dists.^2 / (2*sigmaSpatial^2));  % (8 x nGrid)
 
 %% Detection parameters (tune if needed)
-minEventsForFish = 200;   % min consolidated events in a file to consider fish present
+minEventsForFish = 600;   % min consolidated events in a file to consider fish present
 minPkHeight      = 0.015; % envelope threshold (Hz/amp-unit dependent)
 mpd_ms           = 5;    % MinPeakDistance in ms (per channel)
 merge_ms         = 2;    % cross-channel merge window in ms
 
 % DBSCAN clustering of event positions (per file)
 epsPhys  = 20;  % cm neighborhood radius
-minPts   = 30;  % min events per cluster
+minPts   = 60;  % min events per cluster
 
 % Kalman/association parameters are inside kf_update_tracks_amp()
 
@@ -94,7 +94,7 @@ for i = 1:numel(files)
     env = abs(hilbert(dat));            % envelope per channel
     env = env - median(env,1);          % per-channel baseline
     env = max(env, 0);                  % nonnegative
-    env = env.^2; % help to put signal far from noise, after the EOD detection we use nthroot(max(snap,0), 3 or 4) 
+    env = env.^2; % help to put signal far from noise, after the EOD detection we use nthroot(max(snap,0), 3 or 4)
 
     %% Per-channel peak detection
     mpd = max(1, round((mpd_ms/1000) * Fs));
@@ -131,7 +131,7 @@ for i = 1:numel(files)
     X = XYgrid(kmax,1);  % cm
     Y = XYgrid(kmax,2);  % cm
 
-        figure; plot(X,Y,'or') %to check the X and Y are ok
+    %figure; plot(X,Y,'or') %to check X and Y are ok
     %% Cluster events into fish (per file)
     try
         labels = dbscan([Y X], epsPhys, minPts);  % note [y x] to match earlier plots
@@ -173,26 +173,72 @@ for i = 1:numel(files)
     centroids = centroids(order,:);
     ampSigs   = ampSigs(order,:);
 
+
+    % Count events and duration per cluster (using event labels)
+    tsec = EODt / Fs;
+    clusterCounts = zeros(M,1);
+    clusterDurSec = zeros(M,1);
+    for m = 1:M
+        k = uniq(m);
+        ev = find(labels == k);
+        clusterCounts(m) = numel(ev);
+        if ~isempty(ev)
+            clusterDurSec(m) = max(tsec(ev)) - min(tsec(ev));
+        end
+    end
+
+    % Thresholds to keep reliable clusters
+    minEventsPerCluster = 200;     % ~10 s at 20 Hz; tune 100–300
+    minDurPerCluster    = 5;       % seconds spanned by the cluster
+    minFreqHz           = 5;       % species floor
+    maxFreqHz           = 120;     % species ceiling
+
+    valid = clusterCounts >= minEventsPerCluster & ...
+        clusterDurSec >= minDurPerCluster & ...
+        isfinite(freqs) & freqs >= minFreqHz & freqs <= maxFreqHz;
+
+    % Apply filter
+    centroids = centroids(valid,:);
+    freqs     = freqs(valid);
+    ampSigs   = ampSigs(valid,:);
+    uniq      = uniq(valid);      % keep if you use IDs elsewhere
+    M         = sum(valid);
+
+
     %% Update tracker (keeps IDs across minutes)
     tracks = kf_update_tracks_amp(centroids, freqs, ampSigs, 60);  % dt = 60 s per file
 
-    % Log current estimates
-    if ~isempty(tracks)
-        cur = arrayfun(@(t) [t.id, t.x(1), t.x(2), t.x(5)], tracks, 'uni', 0);
-        cur = vertcat(cur{:});
-        for r = 1:size(cur,1)
-            trackLog = [trackLog; i, cur(r,:)]; %#ok<AGROW>
-        end
+    %% Log + display only tracks matched in THIS minute
+    matchedMask = arrayfun(@(t) t.miss == 0, tracks);
+    if any(matchedMask)
+        curCells = arrayfun(@(t) [t.id, t.x(1), t.x(2), t.x(5)], ...
+            tracks(matchedMask), 'uni', false);
+        cur = vertcat(curCells{:});   % [ID x y f]
+
+        % append to trackLog: [fileIdx ID x y f]
+        trackLog = [trackLog; repmat(i, size(cur,1), 1), cur]; %#ok<AGROW>
+
+        % neat display
         Ttbl = array2table(cur, 'VariableNames', {'ID','x_cm','y_cm','f_Hz'});
         disp(Ttbl);
+    else
+        % no matched tracks this minute
+        fprintf('No matched tracks in file %d (%s)\n', i, fname);
     end
 
-    % Save file summary
-    fileSumm(end+1) = struct('file', fname, 'Fs', Fs, 'nEvents', numel(EODt), ...
-        'nClusters', M, 'centroids', centroids, 'freqs', freqs, ...
-        'trackIDs', ~isempty(tracks)); %#ok<SAGROW>
+    %% Save per-file summary (keep matched IDs for later analysis)
+    fileSumm(end+1) = struct( ...
+        'file',      fname, ...
+        'Fs',        Fs, ...
+        'nEvents',   numel(EODt), ...
+        'nClusters', M, ...
+        'centroids', centroids, ...
+        'freqs',     freqs, ...
+        'trackIDs',  [tracks(matchedMask).id] );   % <- use 'trackIDs' consistently
+
 
     fprintf('Archivo %d %s finalizado en %.2f s\n', i, fname, toc);
+
 end
 
 %% Save outputs
@@ -418,7 +464,7 @@ for j = unDt
 end
 
 % Prune stale tracks
-T = T([T.miss] <= 3);
+T = T([T.miss] <= 10);
 
 tracks = T;
 end
